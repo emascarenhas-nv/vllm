@@ -17,7 +17,11 @@ from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.layers.activation import ReLUSquaredActivation, SiluAndMul
+from vllm.model_executor.layers.activation import (
+    ReLUSquaredActivation,
+    SiluAndMul,
+    SiluAndMulWithClamp,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     get_input_quant_key,
@@ -30,6 +34,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
@@ -176,6 +181,10 @@ _FUSED_ACT_QUANT_SUPPORT: dict[
     tuple[type, QuantKey], Callable[[torch.nn.Module, torch.Tensor, LinearBase], bool]
 ] = {}
 
+# Producers of parameterized activations (e.g. clamp limits) also take act_fn:
+# producer(x, linear, act_fn).
+_FUSED_ACT_QUANT_TAKES_ACT_FN: set[tuple[type, QuantKey]] = set()
+
 # This path is validated on SM90 and newer CUDA devices.
 if current_platform.is_cuda() and current_platform.has_device_capability(90):
     _RELU2_STATIC_FP8_KEY = (ReLUSquaredActivation, kFp8StaticTensorSym)
@@ -187,6 +196,20 @@ if current_platform.is_cuda() and current_platform.has_device_capability(90):
 # Add CUDA-specific entries for dynamic block quantization
 if current_platform.is_cuda_alike():
     _FUSED_ACT_QUANT[(SiluAndMul, kFp8Dynamic128Sym)] = _silu_and_mul_fp8_dynamic_128
+
+# kMxfp8Dynamic consumers (FlashInfer MXFP8 linears) take F8_128x4 scales.
+if current_platform.is_cuda():
+    from vllm.model_executor.layers.fusion.silu_and_mul_clamp_mxfp8_quant import (
+        silu_and_mul_clamp_mxfp8_quant,
+        silu_and_mul_clamp_mxfp8_quant_supported,
+    )
+
+    _CLAMP_MXFP8_KEY = (SiluAndMulWithClamp, kMxfp8Dynamic)
+    _FUSED_ACT_QUANT[_CLAMP_MXFP8_KEY] = silu_and_mul_clamp_mxfp8_quant
+    _FUSED_ACT_QUANT_SUPPORT[_CLAMP_MXFP8_KEY] = (
+        silu_and_mul_clamp_mxfp8_quant_supported
+    )
+    _FUSED_ACT_QUANT_TAKES_ACT_FN.add(_CLAMP_MXFP8_KEY)
 
 # Add NVFP4 if supported (requires SM100+)
 if current_platform.is_cuda() and hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant"):
@@ -209,5 +232,7 @@ def maybe_fused_act_quant(
         producer = _FUSED_ACT_QUANT.get(registry_key)
         support = _FUSED_ACT_QUANT_SUPPORT.get(registry_key)
         if producer is not None and (support is None or support(act_fn, x, linear)):
+            if registry_key in _FUSED_ACT_QUANT_TAKES_ACT_FN:
+                return producer(x, linear, act_fn)
             return producer(x, linear)
     return act_fn(x)
