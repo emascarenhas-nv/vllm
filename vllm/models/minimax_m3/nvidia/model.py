@@ -29,12 +29,15 @@ from vllm.model_executor.layers.attention.attention import set_default_quant_sca
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_and_quant,
+    maybe_fused_allreduce_gemma_rms_norm_quant,
 )
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
@@ -184,8 +187,19 @@ class MiniMaxM3MLP(nn.Module):
             alpha=config.swiglu_alpha,
             beta=config.swiglu_beta,
         )
+        # gate_up_proj's pre-quantized input for the next forward, set by the
+        # owning MoE block: FusedMoE invokes the shared expert with the bf16
+        # hidden states only.
+        self.pending_quantized_input: QuantizedActivation | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor | QuantizedActivation) -> torch.Tensor:
+        pending = self.pending_quantized_input
+        if (
+            pending is not None
+            and isinstance(x, torch.Tensor)
+            and pending.orig_shape == x.shape
+        ):
+            x = pending
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -276,15 +290,25 @@ class MiniMaxM3MoE(nn.Module):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight.to(torch.float32))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_experts_input: QuantizedActivation | None = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if shared_experts_input is not None and self.shared_experts is not None:
+            self.shared_experts.pending_quantized_input = shared_experts_input
+        try:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+        finally:
+            if self.shared_experts is not None:
+                self.shared_experts.pending_quantized_input = None
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -366,7 +390,7 @@ class MiniMaxM3Attention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | QuantizedActivation,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         # Fused per-head Gemma QK-norm + partial NeoX RoPE on q/k, in place.
@@ -582,7 +606,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | QuantizedActivation,
     ) -> torch.Tensor:
         # Single fused projection emitting [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
@@ -768,8 +792,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_input_allreduce and residual is not None:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
+            # qkv_proj is the only consumer: it may take its MXFP8 input.
+            hidden_states, residual = maybe_fused_allreduce_gemma_rms_norm_quant(
+                self.input_layernorm,
+                hidden_states,
+                self.self_attn.qkv_proj,
+                residual,
             )
         else:
             if residual is None:
@@ -782,12 +810,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+        if not self.is_moe_layer:
+            # Dense MLP: gate_up_proj is the only consumer.
+            hidden_states, residual = maybe_fused_allreduce_gemma_rms_norm_quant(
+                self.post_attention_layernorm,
+                hidden_states,
+                self.mlp.gate_up_proj,
+                residual,
+            )
+            return self.mlp(hidden_states), residual
+        moe = self.block_sparse_moe
+        if moe.shared_experts is None:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+            return moe(hidden_states), residual
+        # The router and routed experts read the bf16 norm output; the shared
+        # expert's gate_up_proj may take an MXFP8 copy from the same kernel.
+        hidden_states, quantized, residual = fused_allreduce_gemma_rms_norm_and_quant(
+            self.post_attention_layernorm,
+            hidden_states,
+            moe.shared_experts.gate_up_proj,
+            residual,
         )
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states)
-        return hidden_states, residual
+        return moe(hidden_states, shared_experts_input=quantized), residual
 
     @property
     def ffn_all_reduce_deferred(self) -> bool:

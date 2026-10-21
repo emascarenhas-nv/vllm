@@ -8,10 +8,13 @@ into a ``GemmaRMSNorm`` that adds the residual and normalizes. flashinfer ships 
 kernel that fuses all-reduce + residual-add + RMSNorm into a single launch; this
 helper drives it directly (no torch.compile pass) for models that run eager.
 
-Scope: attention output only, no quantization. When the flashinfer fast path is
-not applicable (TP==1, flashinfer/NVSwitch unavailable, unsupported dtype, or an
-oversize batch) it falls back to ``all_reduce`` + ``GemmaRMSNorm``, which is
-numerically identical to the unfused model path.
+Scope: attention output. ``maybe_fused_allreduce_gemma_rms_norm_quant`` also
+hands the next linear its pre-quantized MXFP8 input (a QuantizedActivation) from
+the same kernel when that linear consumes one; it is the all-reduce counterpart
+of ``maybe_fused_norm_quant``. When the flashinfer fast path is not applicable
+(TP==1, flashinfer/NVSwitch unavailable, unsupported dtype, or an oversize
+batch) it falls back to ``all_reduce`` + ``GemmaRMSNorm``, which is numerically
+identical to the unfused model path.
 """
 
 import torch
@@ -22,8 +25,17 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    get_input_quant_key,
+)
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
+
+logger = init_logger(__name__)
 
 MiB = 1024 * 1024
 
@@ -44,10 +56,21 @@ try:
         if flashinfer_comm is not None
         else None
     )
+    # MXFP8 (F8_128x4 swizzled scales) output patterns of the trtllm kernel;
+    # None with flashinfer builds that predate them.
+    _fi_patterns = getattr(flashinfer_comm, "AllReduceFusionPattern", None)
+    _AR_RESIDUAL_RMS_NORM_MXFP8 = getattr(
+        _fi_patterns, "kARResidualRMSNormMXFP8Quant", None
+    )
+    _AR_RESIDUAL_RMS_NORM_OUT_MXFP8 = getattr(
+        _fi_patterns, "kARResidualRMSNormOutMXFP8Quant", None
+    )
 except (ImportError, AttributeError):
     flashinfer_trtllm_fused_allreduce_norm = None  # type: ignore[assignment]
     get_fi_ar_workspace = None  # type: ignore[assignment]
     _AR_RESIDUAL_RMS_NORM = None
+    _AR_RESIDUAL_RMS_NORM_MXFP8 = None
+    _AR_RESIDUAL_RMS_NORM_OUT_MXFP8 = None
 
 
 _FI_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
@@ -65,8 +88,11 @@ def _max_token_num(tp_size: int, hidden_size: int, dtype: torch.dtype) -> int | 
     return int(max_size_mb * MiB) // (hidden_size * element_size)
 
 
-def _can_use_flashinfer(hidden_states: torch.Tensor, tp_size: int) -> tuple[bool, int]:
-    """Whether the flashinfer fused path applies; returns (ok, max_token_num)."""
+def _can_use_flashinfer(
+    hidden_states: torch.Tensor, tp_size: int, require_trtllm: bool = False
+) -> tuple[bool, int]:
+    """Whether the flashinfer fused path applies; returns (ok, max_token_num).
+    ``require_trtllm``: only the trtllm workspace backend (quantized patterns)."""
     if (
         flashinfer_trtllm_fused_allreduce_norm is None
         or get_fi_ar_workspace is None
@@ -97,6 +123,8 @@ def _can_use_flashinfer(hidden_states: torch.Tensor, tp_size: int) -> tuple[bool
         group=get_tp_group().cpu_group,
     )
     if workspace is None:
+        return False, 0
+    if require_trtllm and getattr(workspace, "backend", None) != "trtllm":
         return False, 0
     # The token-count bound above uses the whole workspace budget, but a backend
     # may use only a fraction of it per call (mnnvl rotates through three Lamport
@@ -188,3 +216,129 @@ def fused_allreduce_gemma_rms_norm(
     # Fallback: explicit all-reduce + GemmaRMSNorm (matches the unfused model).
     reduced = tensor_model_parallel_all_reduce(hidden_states)
     return norm(reduced, residual)
+
+
+def _takes_swizzled_mxfp8_input(linear: torch.nn.Module) -> bool:
+    """Whether ``linear`` consumes an MXFP8 QuantizedActivation with F8_128x4
+    swizzled scales (as DeepSeek-V4.1's can_fuse_query_quant)."""
+    if not current_platform.is_cuda():
+        return False
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+
+    # QuantKey does not encode scale layout; restrict the producer to the
+    # consumers that accept F8_128x4 swizzled scales.
+    return get_input_quant_key(linear) == kMxfp8Dynamic and type(
+        getattr(getattr(linear, "quant_method", None), "kernel", None)
+    ) in (FlashInferCutedslMxfp8LinearKernel, FlashInferCutlassMxfp8LinearKernel)
+
+
+def _fused_allreduce_gemma_rms_norm_mxfp8(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+    linear: torch.nn.Module,
+    need_norm_out: bool,
+) -> tuple[torch.Tensor | None, QuantizedActivation, torch.Tensor] | None:
+    """The trtllm fused all-reduce + residual + GemmaRMSNorm, also writing the
+    MXFP8 input of ``linear``. None when that path does not apply."""
+    tp_size = get_tensor_model_parallel_world_size()
+    pattern = (
+        _AR_RESIDUAL_RMS_NORM_OUT_MXFP8
+        if need_norm_out
+        else _AR_RESIDUAL_RMS_NORM_MXFP8
+    )
+    if (
+        tp_size == 1
+        or pattern is None
+        or hidden_states.dim() != 2
+        or hidden_states.shape[-1] % 32 != 0
+        or not _takes_swizzled_mxfp8_input(linear)
+    ):
+        return None
+    ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size, require_trtllm=True)
+    if not ok:
+        return None
+    num_tokens, hidden_size = hidden_states.shape
+    quant_out = torch.empty(
+        (num_tokens, hidden_size),
+        dtype=torch.float8_e4m3fn,
+        device=hidden_states.device,
+    )
+    # F8_128x4: rows padded to 128, scale columns to 4.
+    scale_out = torch.empty(
+        (round_up(num_tokens, 128) * round_up(hidden_size // 32, 4),),
+        dtype=torch.uint8,
+        device=hidden_states.device,
+    )
+    norm_out = torch.empty_like(hidden_states) if need_norm_out else None
+    flashinfer_trtllm_fused_allreduce_norm(
+        allreduce_in=hidden_states,
+        residual=residual,
+        rms_gamma=norm.weight,
+        rms_eps=norm.variance_epsilon,
+        world_size=tp_size,
+        weight_bias=1.0,  # GemmaRMSNorm-style
+        launch_with_pdl=True,
+        fp32_acc=True,
+        max_token_num=max_token_num,
+        pattern_code=pattern,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
+    )
+    logger.info_once(
+        "Fused all-reduce + GemmaRMSNorm writes the MXFP8 input of %s.",
+        type(linear).__name__,
+    )
+    quantized = QuantizedActivation(
+        data=quant_out,
+        scale=scale_out,
+        orig_dtype=hidden_states.dtype,
+        orig_shape=hidden_states.shape,
+        quant_key=kMxfp8Dynamic,
+    )
+    # With norm_out the kernel writes the new residual into the hidden_states
+    # buffer; without it, into ``residual`` in place.
+    return norm_out, quantized, hidden_states if need_norm_out else residual
+
+
+def maybe_fused_allreduce_gemma_rms_norm_quant(
+    norm_fn: GemmaRMSNorm,
+    x: torch.Tensor,
+    linear: torch.nn.Module,
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor | QuantizedActivation, torch.Tensor]:
+    """``fused_allreduce_gemma_rms_norm`` for a normalized output whose only
+    consumer is ``linear``: returns its MXFP8 QuantizedActivation from the same
+    kernel when ``linear`` consumes one, else the bf16 output. Returns
+    ``(hidden_states, new_residual)``, like ``maybe_fused_norm_quant``."""
+    fused = _fused_allreduce_gemma_rms_norm_mxfp8(
+        x, residual, norm_fn, linear, need_norm_out=False
+    )
+    if fused is not None:
+        _, quantized, residual = fused
+        return quantized, residual
+    return fused_allreduce_gemma_rms_norm(x, residual, norm_fn)
+
+
+def fused_allreduce_gemma_rms_norm_and_quant(
+    norm_fn: GemmaRMSNorm,
+    x: torch.Tensor,
+    linear: torch.nn.Module,
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor, QuantizedActivation | None, torch.Tensor]:
+    """``fused_allreduce_gemma_rms_norm`` whose bf16 output has other consumers
+    besides ``linear``: returns ``(norm_out, quantized, new_residual)``, where
+    ``quantized`` is ``linear``'s MXFP8 input from the same kernel, or None."""
+    fused = _fused_allreduce_gemma_rms_norm_mxfp8(
+        x, residual, norm_fn, linear, need_norm_out=True
+    )
+    if fused is not None:
+        norm_out, quantized, residual = fused
+        assert norm_out is not None
+        return norm_out, quantized, residual
+    norm_out, residual = fused_allreduce_gemma_rms_norm(x, residual, norm_fn)
+    return norm_out, None, residual
