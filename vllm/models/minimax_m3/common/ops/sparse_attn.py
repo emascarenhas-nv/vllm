@@ -435,6 +435,8 @@ def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
     lse_ptr,  # partials (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
     out_ptr,  # merged out: [total_q, num_heads, head_dim]
+    q_out_ptr,  # MXFP8_OUT: e4m3 [>= total_q, num_heads * head_dim]
+    q_scale_ptr,  # MXFP8_OUT: 1D F8_128x4 swizzled UE8M0 scales
     head_dim,
     stride_o_c,
     stride_o_b,
@@ -449,6 +451,7 @@ def _merge_topk_attn_out_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     USE_PDL: tl.constexpr,
+    MXFP8_OUT: tl.constexpr = False,
 ):
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
 
@@ -474,10 +477,49 @@ def _merge_topk_attn_out_kernel(
     weights = tl.exp2(lse - lse_max)
     weights = weights / tl.sum(weights, axis=0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
-    out_ptrs = (
-        out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
-    )
-    tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=d_mask)
+    if MXFP8_OUT:
+        # Write o_proj's MXFP8 input (row-major [total_q, num_heads * head_dim])
+        # instead of the bf16 output: the quant of the bf16-rounded merge, as
+        # o_proj's own mxfp8_e4m3_quantize would compute it. Each program owns
+        # the head_dim // 32 scale groups of one (row, head).
+        NUM_GROUPS: tl.constexpr = BLOCK_SIZE_D // 32
+        x = o_merged.to(out_ptr.dtype.element_ty).to(tl.float32)
+        xg = tl.reshape(x, (NUM_GROUPS, 32))
+        # UE8M0 = ceil_pow2(amax / 448), saturated to [0, 254].
+        amax = tl.max(tl.abs(xg), axis=1)
+        norm = amax * (1.0 / 448.0)
+        bits = norm.to(tl.uint32, bitcast=True)
+        exp_biased = (bits >> 23) & 0xFF
+        mantissa = bits & 0x7FFFFF
+        bump = tl.where(
+            (mantissa != 0) & ~((exp_biased == 0) & (mantissa <= 0x400000)), 1, 0
+        )
+        sf = tl.minimum(exp_biased + bump, 254)
+        sf = tl.where(norm <= 0.0, 0, sf)
+        # Exact inverse scale 2^(127 - sf); 0 when sf == 0.
+        inv_scale = tl.where(
+            sf == 0, 0.0, ((254 - sf) << 23).to(tl.float32, bitcast=True)
+        )
+        q = tl.minimum(tl.maximum(xg * inv_scale[:, None], -448.0), 448.0)
+        k_total = tl.num_programs(1) * BLOCK_SIZE_D
+        q_ptrs = q_out_ptr + pid_b * k_total + pid_h * BLOCK_SIZE_D + off_d
+        tl.store(q_ptrs, tl.reshape(q, (BLOCK_SIZE_D,)).to(q_out_ptr.dtype.element_ty))
+        # F8_128x4: [row // 128, col // 4, row % 32, row % 128 // 32, col % 4].
+        c = pid_h * NUM_GROUPS + tl.arange(0, NUM_GROUPS)
+        num_k_tiles = (k_total // 32 + 3) // 4
+        sf_off = (
+            (pid_b // 128) * (num_k_tiles * 512)
+            + (c // 4) * 512
+            + (pid_b % 32) * 16
+            + ((pid_b % 128) // 32) * 4
+            + (c % 4)
+        )
+        tl.store(q_scale_ptr + sf_off, sf.to(tl.uint8))
+    else:
+        out_ptrs = (
+            out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
+        )
+        tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=d_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -625,8 +667,16 @@ def minimax_m3_sparse_attn_decode(
     decode_query_len: int,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
-    """GQA block-sparse attention for decode (split-K over the top-k blocks)."""
+    """GQA block-sparse attention for decode (split-K over the top-k blocks).
+
+    With ``mxfp8_out=(data, scale)`` the merged output is written only as
+    o_proj's MXFP8 input and ``output`` is left untouched: ``data`` is e4m3
+    [>= total_q, num_heads * head_dim] and ``scale`` the 1D F8_128x4 swizzled
+    UE8M0 scales. Rows past total_q (cudagraph padding) are not written; o_proj
+    discards their outputs, as it does for the unwritten bf16 ``output`` rows.
+    """
     total_q, num_heads, head_dim = q.shape
     assert total_q == seq_lens.shape[0] * decode_query_len
     max_topk = topk_idx.shape[-1]
@@ -716,10 +766,19 @@ def minimax_m3_sparse_attn_decode(
         **pdl_launch,
     )
     merge_grid = (total_q, num_heads)
+    if mxfp8_out is not None:
+        q_out, q_scale = mxfp8_out
+        assert head_dim % 32 == 0 and triton.next_power_of_2(head_dim) == head_dim
+        assert q_out.is_contiguous() and q_out.shape[1] == num_heads * head_dim
+        assert q_out.shape[0] >= total_q
+    else:
+        q_out, q_scale = output, output
     _merge_topk_attn_out_kernel[merge_grid](
         o_partial,
         lse_partial,
         output,
+        q_out,
+        q_scale,
         head_dim,
         o_partial.stride(0),
         o_partial.stride(1),
@@ -733,5 +792,6 @@ def minimax_m3_sparse_attn_decode(
         output.stride(2),
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_PDL=use_pdl,
+        MXFP8_OUT=mxfp8_out is not None,
         **pdl_launch,
     )

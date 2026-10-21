@@ -13,6 +13,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 """
 
 from collections.abc import Iterable
+from functools import cached_property
 
 import torch
 from torch import nn
@@ -23,6 +24,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
@@ -35,6 +37,10 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    get_input_quant_key,
+)
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
@@ -43,6 +49,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -88,12 +95,15 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
+
+logger = init_logger(__name__)
 
 
 def _sparse_attention_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -389,6 +399,21 @@ class MiniMaxM3Attention(nn.Module):
         return output
 
 
+def _takes_swizzled_mxfp8_input(linear: nn.Module) -> bool:
+    """Whether ``linear`` consumes an MXFP8 QuantizedActivation with F8_128x4
+    swizzled scales (as DeepSeek-V4.1's can_fuse_query_quant)."""
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+
+    # QuantKey does not encode scale layout; restrict the producer to the
+    # consumers that accept F8_128x4 swizzled scales.
+    return get_input_quant_key(linear) == kMxfp8Dynamic and type(
+        getattr(getattr(linear, "quant_method", None), "kernel", None)
+    ) in (FlashInferCutedslMxfp8LinearKernel, FlashInferCutlassMxfp8LinearKernel)
+
+
 class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     """Block-sparse attention layer with the lightning-indexer branch.
 
@@ -650,9 +675,40 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
 
         output = torch.empty_like(q)
-        attn_output = self._run_attention(q, query_fp8, index_q, output)
+        if self._emit_mxfp8_attn_out:
+            # The attention writes o_proj's MXFP8 input itself. The buffers are
+            # allocated here, outside the eager break, so their addresses stay
+            # fixed across breakable-cudagraph replays.
+            mx_data = torch.empty(q.shape, dtype=torch.float8_e4m3fn, device=q.device)
+            mx_scale = torch.empty(
+                # F8_128x4: rows padded to 128, scale columns to 4.
+                (round_up(num_tokens, 128) * round_up(self.q_size // 32, 4),),
+                dtype=torch.uint8,
+                device=q.device,
+            )
+            self._run_attention(q, query_fp8, index_q, output, mx_data, mx_scale)
+            attn_output: torch.Tensor | QuantizedActivation = QuantizedActivation(
+                data=mx_data,
+                scale=mx_scale,
+                orig_dtype=q.dtype,
+                orig_shape=q.shape,
+                quant_key=kMxfp8Dynamic,
+            )
+        else:
+            attn_output = self._run_attention(q, query_fp8, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
+
+    @cached_property
+    def _emit_mxfp8_attn_out(self) -> bool:
+        """The attention impl can write o_proj's MXFP8 input (F8_128x4 scales)
+        and o_proj consumes it in place of its own input quant."""
+        emit = getattr(self.impl, "supports_mxfp8_output", False) and (
+            _takes_swizzled_mxfp8_input(self.o_proj)
+        )
+        if emit:
+            logger.info_once("MiniMax M3 sparse attention writes o_proj's MXFP8 input")
+        return emit
 
     @eager_break_during_capture
     def _run_attention(
@@ -661,17 +717,29 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         query_fp8: torch.Tensor | None,
         index_query: torch.Tensor,
         output: torch.Tensor,
+        mxfp8_data: torch.Tensor | None = None,
+        mxfp8_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Single eager break around both: their split-K kernels read per-request
         # metadata and can't be captured into a cudagraph. The indexer writes its
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
         self.indexer(index_query)
+        if mxfp8_data is None:
+            return self.impl.forward(
+                self,
+                query,
+                self.kv_cache,
+                output,
+                query_fp8=query_fp8,
+            )
+        assert mxfp8_scale is not None
         return self.impl.forward(
             self,
             query,
             self.kv_cache,
             output,
             query_fp8=query_fp8,
+            mxfp8_out=(mxfp8_data, mxfp8_scale),
         )
 
 

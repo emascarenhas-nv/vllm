@@ -19,6 +19,9 @@ from vllm.config.attention import MiniMaxM3MSADecodeBackend
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
+)
 from vllm.models.minimax_m3.common.ops.sparse_attn import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_sparse_attn_decode,
@@ -233,6 +236,10 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             "MiniMax M3 MSA sparse decode selected %s",
             "CUTLASS" if self.use_cutlass_decode else "Triton",
         )
+        # forward() can write o_proj's MXFP8 input (``mxfp8_out``). Only the
+        # Triton decode merge emits it; with CUTLASS decode selected, the caller
+        # keeps the bf16 output and o_proj quantizes it as before.
+        self.supports_mxfp8_output = not self.use_cutlass_decode
 
     def should_use_msa_decode(self, layer_name: str) -> bool:
         if not self.use_cutlass_decode:
@@ -257,7 +264,14 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
         output: torch.Tensor,
         *,
         query_fp8: torch.Tensor | None = None,
+        mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """With ``mxfp8_out=(data, scale)`` (only if supports_mxfp8_output) the
+        result is written as o_proj's MXFP8 input: e4m3 ``data`` [num_tokens,
+        num_heads * head_size] and 1D F8_128x4 swizzled UE8M0 ``scale``. Pure
+        decode batches emit it from the split-K merge and leave ``output``
+        unwritten; batches with prefill quantize ``output`` into the buffers."""
+        assert mxfp8_out is None or self.supports_mxfp8_output
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return output  # profiling run; caches unbound
@@ -332,7 +346,10 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                     d.decode_query_len,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    mxfp8_out=mxfp8_out if main_md.num_prefills == 0 else None,
                 )
+                if mxfp8_out is not None and main_md.num_prefills == 0:
+                    return output
 
         # Prefill [nd:]: MSA sparse FMHA over the selected blocks.
         if main_md.num_prefills > 0:
@@ -411,4 +428,12 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                 schedule=schedule,
                 out=out[nd:],
             )
+        if mxfp8_out is not None:
+            # Batches with prefill: the quant o_proj would run on ``output``.
+            data, scale = mxfp8_out
+            q, sf = mxfp8_e4m3_quantize(
+                output.view(data.shape), is_sf_swizzled_layout=True
+            )
+            data.copy_(q)
+            scale.copy_(sf.view(-1))
         return output
