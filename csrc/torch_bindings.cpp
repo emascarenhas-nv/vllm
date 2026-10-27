@@ -257,6 +257,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "silu_and_mul_nvfp4_quant(Tensor! result, Tensor! result_block_scale, "
       "Tensor input, Tensor input_global_scale) -> ()");
 
+  // Fused SiLU+Mul with clamp + MXFP8 quantization (F8_128x4 swizzled scales).
+  ops.def(
+      "silu_and_mul_with_clamp_mxfp8_quant(Tensor! result, Tensor! "
+      "result_scale, Tensor input, float limit, float alpha=1.0, "
+      "float beta=0.0) -> ()");
+
   // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
   // of the given capability
   ops.def("cutlass_scaled_mm_supports_fp4(int cuda_device_capability) -> bool");
@@ -838,6 +844,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("silu_and_mul_scaled_fp4_experts_quant",
            TORCH_BOX(&silu_and_mul_scaled_fp4_experts_quant));
   ops.impl("silu_and_mul_nvfp4_quant", TORCH_BOX(&silu_and_mul_nvfp4_quant));
+  ops.impl("silu_and_mul_with_clamp_mxfp8_quant",
+           TORCH_BOX(&silu_and_mul_with_clamp_mxfp8_quant));
   // mxfp4_experts_quant: registered in mxfp4_experts_quant.cu (SM100 only).
   // W4A8 ops: registered in w4a8_mm_entry.cu / w4a8_grouped_mm_entry.cu.
 

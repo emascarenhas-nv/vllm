@@ -17,7 +17,11 @@ from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.layers.activation import ReLUSquaredActivation, SiluAndMul
+from vllm.model_executor.layers.activation import (
+    ReLUSquaredActivation,
+    SiluAndMul,
+    SiluAndMulWithClamp,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     get_input_quant_key,
@@ -26,10 +30,12 @@ from vllm.model_executor.layers.fusion.relu2_fp8_quant import (
     relu_squared_static_fp8_quant,
 )
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import MXFP8_BLOCK_SIZE
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
@@ -144,6 +150,33 @@ def _silu_and_mul_nvfp4_dynamic(
     )
 
 
+def _silu_and_mul_clamp_mxfp8_dynamic(
+    x: torch.Tensor, linear: LinearBase, act_fn: SiluAndMulWithClamp
+) -> QuantizedActivation:
+    """SiluAndMulWithClamp + dynamic MXFP8 quantization (F8_128x4 scales)."""
+    d = x.shape[-1] // 2
+    out_shape = x.shape[:-1] + (d,)
+    num_tokens = x.numel() // x.shape[-1]
+    # 2D, like the consumer's own mxfp8_e4m3_quantize(x.view(-1, K)).
+    result = torch.empty((num_tokens, d), dtype=FP8_DTYPE, device=x.device)
+    # Rows padded to 128 and scale columns to 4, as mxfp8_e4m3_quantize returns.
+    block_scale = torch.empty(
+        round_up(num_tokens, 128) * round_up(d // MXFP8_BLOCK_SIZE, 4),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+    torch.ops._C.silu_and_mul_with_clamp_mxfp8_quant(
+        result, block_scale, x, act_fn.swiglu_limit, act_fn.alpha, act_fn.beta
+    )
+    return QuantizedActivation(
+        data=result,
+        scale=block_scale,
+        orig_dtype=x.dtype,
+        orig_shape=out_shape,
+        quant_key=kMxfp8Dynamic,
+    )
+
+
 # (activation module type, consumer input quantization key) -> fused producer.
 # Add a row for each supported manual producer.
 _FUSED_ACT_QUANT: dict[tuple[type, QuantKey], Callable] = {
@@ -170,11 +203,40 @@ def _relu_squared_static_fp8_quant_supported(
     )
 
 
+def _silu_and_mul_clamp_mxfp8_supported(
+    act_fn: torch.nn.Module,
+    x: torch.Tensor,
+    linear: LinearBase,
+) -> bool:
+    """Return whether the clamped-SwiGLU MXFP8 producer can feed this linear.
+
+    Only the FlashInfer MXFP8 kernels take its F8_128x4 swizzled scales.
+    """
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+
+    kernel = getattr(getattr(linear, "quant_method", None), "kernel", None)
+    return (
+        isinstance(act_fn, SiluAndMulWithClamp)
+        and type(kernel)
+        in (FlashInferCutedslMxfp8LinearKernel, FlashInferCutlassMxfp8LinearKernel)
+        and x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.is_contiguous()
+        and x.shape[-1] % (2 * MXFP8_BLOCK_SIZE) == 0
+    )
+
+
 # Optional per-entry predicates preserve the unconditional fallback contract
 # for producers whose supported inputs are narrower than their registry key.
 _FUSED_ACT_QUANT_SUPPORT: dict[
     tuple[type, QuantKey], Callable[[torch.nn.Module, torch.Tensor, LinearBase], bool]
 ] = {}
+
+# Producers that need the activation's parameters also get act_fn.
+_FUSED_ACT_QUANT_TAKES_ACT_FN: set[tuple[type, QuantKey]] = set()
 
 # This path is validated on SM90 and newer CUDA devices.
 if current_platform.is_cuda() and current_platform.has_device_capability(90):
@@ -191,6 +253,15 @@ if current_platform.is_cuda_alike():
 # Add NVFP4 if supported (requires SM100+)
 if current_platform.is_cuda() and hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant"):
     _FUSED_ACT_QUANT[(SiluAndMul, kNvfp4Dynamic)] = _silu_and_mul_nvfp4_dynamic
+
+# Add clamped SwiGLU + MXFP8 for the FlashInfer MXFP8 linears
+if current_platform.is_cuda() and hasattr(
+    torch.ops._C, "silu_and_mul_with_clamp_mxfp8_quant"
+):
+    _CLAMP_MXFP8_KEY = (SiluAndMulWithClamp, kMxfp8Dynamic)
+    _FUSED_ACT_QUANT[_CLAMP_MXFP8_KEY] = _silu_and_mul_clamp_mxfp8_dynamic
+    _FUSED_ACT_QUANT_SUPPORT[_CLAMP_MXFP8_KEY] = _silu_and_mul_clamp_mxfp8_supported
+    _FUSED_ACT_QUANT_TAKES_ACT_FN.add(_CLAMP_MXFP8_KEY)
 
 
 def maybe_fused_act_quant(
@@ -209,5 +280,7 @@ def maybe_fused_act_quant(
         producer = _FUSED_ACT_QUANT.get(registry_key)
         support = _FUSED_ACT_QUANT_SUPPORT.get(registry_key)
         if producer is not None and (support is None or support(act_fn, x, linear)):
+            if registry_key in _FUSED_ACT_QUANT_TAKES_ACT_FN:
+                return producer(x, linear, act_fn)
             return producer(x, linear)
     return act_fn(x)

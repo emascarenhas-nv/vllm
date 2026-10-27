@@ -543,6 +543,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/quantization/fp4/nvfp4_quant_entry.cu"
       "csrc/quantization/fp4/nvfp4_scaled_mm_entry.cu"
       "csrc/quantization/awq/gemm_kernels.cu"
+      "csrc/quantization/fused_kernels/fused_silu_mul_clamp_mxfp8_quant.cu"
       "csrc/minimax_reduce_rms_kernel.cu")
 
     #

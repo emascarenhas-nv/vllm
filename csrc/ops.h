@@ -151,6 +151,12 @@ void silu_and_mul_nvfp4_quant(torch::stable::Tensor& out,
                               torch::stable::Tensor& input,
                               torch::stable::Tensor& input_global_scale);
 
+void silu_and_mul_with_clamp_mxfp8_quant(torch::stable::Tensor& out,
+                                         torch::stable::Tensor& out_scale,
+                                         torch::stable::Tensor const& input,
+                                         double limit, double alpha,
+                                         double beta);
+
 void cutlass_mxfp4_group_mm(torch::stable::Tensor& output,
                             const torch::stable::Tensor& a,
                             const torch::stable::Tensor& b,

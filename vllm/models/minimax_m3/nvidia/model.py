@@ -60,6 +60,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _unpack
+from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -499,7 +500,7 @@ class MiniMaxM3MLP(nn.Module):
             x = fused_gemm1(x, self.gate_up_proj, self.act_fn)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            x = self.act_fn(gate_up)
+            x = maybe_fused_act_quant(self.act_fn, gate_up, self.down_proj)
         if self.use_sequence_parallel:
             return _row_parallel_reduce_scatter(x, self.down_proj, self.gemm_rs)
         x, _ = self.down_proj(x)
