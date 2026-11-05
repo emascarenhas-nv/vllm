@@ -17,6 +17,7 @@ from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.fusion.quant_activation import get_input_quant_key
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -270,7 +271,8 @@ class MiniMaxM3DSparkMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x, _ = self.down_proj(self.act_fn(gate_up))
+        x = maybe_fused_act_quant(self.act_fn, gate_up, self.down_proj)
+        x, _ = self.down_proj(x)
         return x
 
 
