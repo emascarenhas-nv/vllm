@@ -301,6 +301,10 @@ steps:
   - vllm/utils/flashinfer.py
   - vllm/model_executor/layers/fusion/fused_act_quant.py
   - csrc/quantization/fused_kernels/fused_silu_mul_clamp_mxfp8_quant.cu
+  - vllm/model_executor/layers/activation.py
+  - vllm/model_executor/kernels/linear/mxfp8/Mxfp8LinearKernel.py
+  - vllm/model_executor/kernels/linear/mxfp8/flashinfer.py
+  - vllm/model_executor/kernels/linear/mxfp8/pytorch.py
   - tests/models/minimax_m3/
   commands:
     - pytest -v -s models/minimax_m3 --ignore=models/minimax_m3/amd_specialized_decode
@@ -753,10 +757,7 @@ steps:
   - vllm/_custom_ops.py
   - csrc/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu
   - csrc/quantization/fused_kernels/fused_silu_mul_clamp_mxfp8_quant.cu
-  - vllm/model_executor/layers/fusion/fused_act_quant.py
   - csrc/activation_kernels.cu
-  - vllm/model_executor/layers/activation.py
-  - vllm/model_executor/kernels/linear/mxfp8/
   - vllm/model_executor/layers/quantization/utils/mxfp8_utils.py
   - csrc/ops.h
   - csrc/torch_bindings.cpp
