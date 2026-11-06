@@ -30,7 +30,11 @@ from vllm.model_executor.layers.fusion.relu2_fp8_quant import (
     relu_squared_static_fp8_quant,
 )
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import MXFP8_BLOCK_SIZE
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -158,11 +162,11 @@ def _silu_and_mul_clamp_mxfp8_dynamic(
     out_shape = x.shape[:-1] + (d,)
     num_tokens = x.numel() // x.shape[-1]
     # 2D, like the consumer's own mxfp8_e4m3_quantize(x.view(-1, K)).
-    result = torch.empty((num_tokens, d), dtype=FP8_DTYPE, device=x.device)
+    result = torch.empty((num_tokens, d), dtype=MXFP8_VALUE_DTYPE, device=x.device)
     # Rows padded to 128 and scale columns to 4, as mxfp8_e4m3_quantize returns.
     block_scale = torch.empty(
         round_up(num_tokens, 128) * round_up(d // MXFP8_BLOCK_SIZE, 4),
-        dtype=torch.uint8,
+        dtype=MXFP8_SCALE_DTYPE,
         device=x.device,
     )
     torch.ops._C.silu_and_mul_with_clamp_mxfp8_quant(
@@ -210,7 +214,9 @@ def _silu_and_mul_clamp_mxfp8_supported(
 ) -> bool:
     """Return whether the clamped-SwiGLU MXFP8 producer can feed this linear.
 
-    Only the FlashInfer MXFP8 kernels take its F8_128x4 swizzled scales.
+    kMxfp8Dynamic does not encode the scale layout, so only the FlashInfer
+    MXFP8 linear kernels, which take F8_128x4 swizzled scales and are validated
+    with this producer, are accepted.
     """
     from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
         FlashInferCutedslMxfp8LinearKernel,
@@ -225,6 +231,8 @@ def _silu_and_mul_clamp_mxfp8_supported(
         and x.is_cuda
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.is_contiguous()
+        and x.ndim >= 2
+        and x.shape[-1] > 0
         and x.shape[-1] % (2 * MXFP8_BLOCK_SIZE) == 0
     )
 

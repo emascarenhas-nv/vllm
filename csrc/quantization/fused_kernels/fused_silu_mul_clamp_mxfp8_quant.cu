@@ -27,10 +27,14 @@ namespace mxfp8_act_quant {
 constexpr int kSfVecSize = 32;
 constexpr int kColsPerWord = 128;
 constexpr int kMaxThreadsPerBlock = 256;
-// Up to this many (row, k tile) items the tile kernel runs (its k-tile count
-// must fit gridDim.y).
+// The tile kernel takes inputs of up to this many (row, k tile) items;
+// gridDim.y is its k-tile count.
 constexpr int64_t kTileKernelMaxItems = 512;
 static_assert(kTileKernelMaxItems <= 65535);
+// Larger inputs: 4 elements per lane (one warp per item) up to k4EltsMaxItems
+// items, 8 up to k8EltsMaxItems, then 16 with 256-bit loads (else 8).
+constexpr int64_t k4EltsMaxItems = 4096;
+constexpr int64_t k8EltsMaxItems = 8192;
 constexpr float kE4m3Max = 448.0f;
 
 // FlashInfer's float_to_ue8m0_fast: the biased exponent of v rounded toward
@@ -320,7 +324,6 @@ __global__ void __launch_bounds__(kColsPerWord)
   scalar_t const* gate_ptr = input + row * input_row_stride + col;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  // PDL: the GEMM that produces `input` must have finished.
   cudaGridDependencySynchronize();
 #endif
 
@@ -332,7 +335,6 @@ __global__ void __launch_bounds__(kColsPerWord)
   }
   float const y = clamped_swiglu_one<scalar_t>(gate, up, limit, alpha, beta);
 
-  // NaN-ignoring block max, NaN only if every element is NaN, as FlashInfer.
   float amax = fabsf(y);
 #pragma unroll
   for (int offset = 1; offset < 32; offset <<= 1) {
@@ -341,7 +343,6 @@ __global__ void __launch_bounds__(kColsPerWord)
   uint32_t const code = float_to_ue8m0(amax * (1.0f / kE4m3Max));
 
   if (valid_col) {
-    // Saturate to +-448 before the round-to-nearest cast, as FlashInfer.
     float const q =
         fmaxf(fminf(y * ue8m0_to_inv_scale(code), kE4m3Max), -kE4m3Max);
     out[static_cast<int64_t>(row) * d + col] =
@@ -383,17 +384,6 @@ void launch_pdl(void (*kernel)(Params...), dim3 grid, dim3 block,
   cudaError_t const err = cudaLaunchKernelEx(&config, kernel, args...);
   STD_TORCH_CHECK(err == cudaSuccess, "silu_and_mul_with_clamp_mxfp8_quant: ",
                   cudaGetErrorString(err));
-}
-
-template <typename scalar_t>
-void launch_tile(uint8_t* out, uint32_t* out_sf, scalar_t const* input,
-                 int64_t input_row_stride, int num_rows, int num_padded_rows,
-                 int d, int num_k_tiles, float limit, float alpha, float beta,
-                 cudaStream_t stream) {
-  launch_pdl(silu_and_mul_clamp_mxfp8_quant_tile_kernel<scalar_t>,
-             dim3(num_rows, num_k_tiles), dim3(kColsPerWord), stream, out,
-             out_sf, input, input_row_stride, num_rows, num_padded_rows, d,
-             num_k_tiles, limit, alpha, beta);
 }
 
 template <typename scalar_t, int kEltsPerThread>
@@ -459,12 +449,20 @@ void launch(int device, uint8_t* out, uint32_t* out_sf, scalar_t const* input,
 }  // namespace mxfp8_act_quant
 }  // namespace vllm
 
-void silu_and_mul_with_clamp_mxfp8_quant(
-    torch::stable::Tensor& out,          // [..., d] float8_e4m3fn
-    torch::stable::Tensor& out_scale,    // [ceil(M/128)*128 * ceil(d/128)*4]
-    torch::stable::Tensor const& input,  // [..., 2 * d]
-    double limit, double alpha, double beta) {
-  using vllm::mxfp8_act_quant::kSfVecSize;
+// out = MXFP8(silu_and_mul_with_clamp(input, limit, alpha, beta)).
+// input: [..., 2 * d] bf16/fp16 (gate | up), at least 2-D, d a positive
+// multiple of 32; a 2-D input may be row-strided. out: [..., d]
+// float8_e4m3fn, contiguous. out_scale: contiguous uint8 UE8M0 scales in
+// FlashInfer's F8_128x4 swizzled layout of round_up(rows, 128) x
+// round_up(d / 32, 4); padding rows' and columns' scales are written as 0.
+// input (data pointer and row stride) and out must be 16-byte aligned,
+// out_scale 4-byte aligned.
+void silu_and_mul_with_clamp_mxfp8_quant(torch::stable::Tensor& out,
+                                         torch::stable::Tensor& out_scale,
+                                         torch::stable::Tensor const& input,
+                                         double limit, double alpha,
+                                         double beta) {
+  namespace q = vllm::mxfp8_act_quant;
   STD_TORCH_CHECK(
       input.scalar_type() == torch::headeronly::ScalarType::BFloat16 ||
           input.scalar_type() == torch::headeronly::ScalarType::Half,
@@ -483,13 +481,13 @@ void silu_and_mul_with_clamp_mxfp8_quant(
                   "have strided rows");
 
   int64_t const d = input.size(-1) / 2;
-  STD_TORCH_CHECK(d > 0 && input.size(-1) == 2 * d && d % kSfVecSize == 0,
+  STD_TORCH_CHECK(d > 0 && input.size(-1) == 2 * d && d % q::kSfVecSize == 0,
                   "silu_and_mul_with_clamp_mxfp8_quant: input last dim must "
                   "be 2 * d with d a positive multiple of 32, got ",
                   input.size(-1));
   int64_t const num_rows = input.numel() / input.size(-1);
   int64_t const input_row_stride = input.dim() == 2 ? input.stride(0) : 2 * d;
-  int64_t const num_k_tiles = (d + 127) / 128;
+  int64_t const num_k_tiles = (d + q::kColsPerWord - 1) / q::kColsPerWord;
   int64_t const num_padded_rows = (num_rows + 127) / 128 * 128;
   STD_TORCH_CHECK(
       out.is_contiguous() && out.size(-1) == d && out.numel() == num_rows * d,
@@ -529,29 +527,27 @@ void silu_and_mul_with_clamp_mxfp8_quant(
   bool const use_256b = CUDART_VERSION >= 12090 &&
                         get_device_prop()->major >= 10 &&
                         addr(input) % 32 == 0 && row_bytes % 32 == 0;
-  // By (row, 128-column tile) item count: the tile kernel up to 512 items,
-  // one warp per item up to 4K, then 8 or 16 elements per lane.
   int64_t const items = num_rows * num_k_tiles;
-  bool const use_tile_kernel =
-      items <= vllm::mxfp8_act_quant::kTileKernelMaxItems;
+  bool const use_tile_kernel = items <= q::kTileKernelMaxItems;
   int elts_per_thread = 16;
-  if (items <= 4096) {
+  if (items <= q::k4EltsMaxItems) {
     elts_per_thread = 4;
-  } else if (!use_256b || items <= 8192) {
+  } else if (!use_256b || items <= q::k8EltsMaxItems) {
     elts_per_thread = 8;
   }
 
   VLLM_STABLE_DISPATCH_HALF_TYPES(
       input.scalar_type(), "silu_and_mul_with_clamp_mxfp8_quant", [&] {
         using cuda_t = typename vllm::CUDATypeConverter<scalar_t>::Type;
-        namespace q = vllm::mxfp8_act_quant;
         auto* out_ptr = static_cast<uint8_t*>(out.data_ptr());
         auto* out_sf_ptr = static_cast<uint32_t*>(out_scale.data_ptr());
         auto const* input_ptr = static_cast<cuda_t const*>(input.data_ptr());
         if (use_tile_kernel) {
-          q::launch_tile<cuda_t>(out_ptr, out_sf_ptr, input_ptr,
-                                 input_row_stride, num_rows, num_padded_rows, d,
-                                 num_k_tiles, limit, alpha, beta, stream);
+          q::launch_pdl(q::silu_and_mul_clamp_mxfp8_quant_tile_kernel<cuda_t>,
+                        dim3(num_rows, num_k_tiles), dim3(q::kColsPerWord),
+                        stream, out_ptr, out_sf_ptr, input_ptr,
+                        input_row_stride, num_rows, num_padded_rows, d,
+                        num_k_tiles, limit, alpha, beta);
           return;
         }
         auto const run = [&](auto ept) {
