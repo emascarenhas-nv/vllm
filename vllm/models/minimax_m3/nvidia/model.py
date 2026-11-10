@@ -12,8 +12,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
-import contextlib
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -491,17 +490,13 @@ class MiniMaxM3MLP(nn.Module):
             and _consumes_mxfp8_128x4(self.gate_up_proj)
         )
 
-    @contextlib.contextmanager
-    def prequantized(
-        self, src: torch.Tensor, qa: QuantizedActivation
-    ) -> Iterator[None]:
-        """Within the block, the next forward takes `qa` as gate_up_proj's input
-        if it is called on `src`."""
+    def set_prequant(self, src: torch.Tensor, qa: QuantizedActivation) -> None:
+        """Hand over `src` already quantized, for the next forward only.
+
+        The MoE runner calls the shared expert with the layer's own input
+        tensor, so `src` is checked against it and ignored if it differs.
+        """
         self._prequant = (src, qa)
-        try:
-            yield
-        finally:
-            self._prequant = None
 
     def forward(self, x: torch.Tensor | QuantizedActivation) -> torch.Tensor:
         pre, self._prequant = self._prequant, None
@@ -718,13 +713,12 @@ class MiniMaxM3MoE(nn.Module):
             and self.shared_experts.takes_mxfp8_input(num_tokens)
         )
 
-    def _shared_prequant(
+    def _set_shared_prequant(
         self, hidden_states: torch.Tensor, shared_prequant: QuantizedActivation | None
-    ) -> contextlib.AbstractContextManager:
-        if shared_prequant is None:
-            return contextlib.nullcontext()
-        assert self.shared_experts is not None
-        return self.shared_experts.prequantized(hidden_states, shared_prequant)
+    ) -> None:
+        if shared_prequant is not None:
+            assert self.shared_experts is not None
+            self.shared_experts.set_prequant(hidden_states, shared_prequant)
 
     def forward_unfinalized(
         self,
@@ -733,11 +727,11 @@ class MiniMaxM3MoE(nn.Module):
     ) -> MoEOutput:
         """`forward` with the routed top-k reduction and all-reduce left open."""
         router_logits, _ = self.gate(hidden_states)
+        self._set_shared_prequant(hidden_states, shared_prequant)
         # The runner's custom op returns tensors only, so run its body directly.
-        with self._shared_prequant(hidden_states, shared_prequant):
-            shared_output, routed = _unpack(
-                self.experts._forward_impl(hidden_states, router_logits, hidden_states)
-            )
+        shared_output, routed = _unpack(
+            self.experts._forward_impl(hidden_states, router_logits, hidden_states)
+        )
         assert shared_output is not None
         assert isinstance(routed, UnfinalizedMoEOutput)
         return MoEOutput(routed=routed, shared_output=shared_output)
@@ -758,10 +752,10 @@ class MiniMaxM3MoE(nn.Module):
 
         # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
         router_logits, _ = self.gate(hidden_states)
-        with self._shared_prequant(hidden_states, shared_prequant):
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+        self._set_shared_prequant(hidden_states, shared_prequant)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
