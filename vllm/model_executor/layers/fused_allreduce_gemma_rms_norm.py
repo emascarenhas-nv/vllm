@@ -8,10 +8,11 @@ into a `GemmaRMSNorm` that adds the residual and normalizes. flashinfer ships a
 kernel that fuses all-reduce + residual-add + RMSNorm into a single launch; this
 helper drives it directly (no torch.compile pass) for models that run eager.
 
-Scope: attention output only, no quantization. When the flashinfer fast path is
-not applicable (TP==1, flashinfer/NVSwitch unavailable, unsupported dtype, or an
-oversize batch) it falls back to `all_reduce` + `GemmaRMSNorm`, which is
-numerically identical to the unfused model path.
+When the flashinfer fast path is not applicable (TP==1, flashinfer/NVSwitch
+unavailable, unsupported dtype, or an oversize batch) it falls back to
+`all_reduce` + `GemmaRMSNorm`, which is numerically identical to the unfused
+model path. `flashinfer_allreduce_gemma_rms_norm_mxfp8` also writes the normed
+rows as MXFP8 for the linear that follows; it has no fallback.
 """
 
 import torch
@@ -22,8 +23,16 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 
 MiB = 1024 * 1024
 
@@ -44,10 +53,20 @@ try:
         if flashinfer_comm is not None
         else None
     )
+    # The MXFP8 output patterns arrived in flashinfer 0.7.3; None before it.
+    _fi_patterns = getattr(flashinfer_comm, "AllReduceFusionPattern", None)
+    _AR_RESIDUAL_RMS_NORM_MXFP8 = getattr(
+        _fi_patterns, "kARResidualRMSNormMXFP8Quant", None
+    )
+    _AR_RESIDUAL_RMS_NORM_OUT_MXFP8 = getattr(
+        _fi_patterns, "kARResidualRMSNormOutMXFP8Quant", None
+    )
 except (ImportError, AttributeError):
     flashinfer_trtllm_fused_allreduce_norm = None  # type: ignore[assignment]
     get_fi_ar_workspace = None  # type: ignore[assignment]
     _AR_RESIDUAL_RMS_NORM = None
+    _AR_RESIDUAL_RMS_NORM_MXFP8 = None
+    _AR_RESIDUAL_RMS_NORM_OUT_MXFP8 = None
 
 
 _FI_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
@@ -188,6 +207,73 @@ def fused_allreduce_gemma_rms_norm(
     # Fallback: explicit all-reduce + GemmaRMSNorm (matches the unfused model).
     reduced = tensor_model_parallel_all_reduce(hidden_states)
     return norm(reduced, residual)
+
+
+def flashinfer_allreduce_gemma_rms_norm_mxfp8(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+    return_normed: bool = False,
+) -> tuple[QuantizedActivation, torch.Tensor | None, torch.Tensor] | None:
+    """`fused_allreduce_gemma_rms_norm` whose flashinfer kernel also writes the
+    normed rows as MXFP8 (E4M3 values, UE8M0 scales in the 128x4 swizzled
+    layout), so the MXFP8 linear that follows skips its input quantization.
+
+    Returns `(quantized, normed, new_residual)`, where `normed` is the bf16
+    normed output if `return_normed` (for other consumers), else None. Returns
+    None when the flashinfer kernel does not apply, including flashinfer
+    releases without the MXFP8 patterns; the caller then keeps
+    `fused_allreduce_gemma_rms_norm` and the linear's own quantization.
+    """
+    if return_normed:
+        pattern = _AR_RESIDUAL_RMS_NORM_OUT_MXFP8
+    else:
+        pattern = _AR_RESIDUAL_RMS_NORM_MXFP8
+    tp_size = get_tensor_model_parallel_world_size()
+    if pattern is None or tp_size == 1 or hidden_states.shape[-1] % MXFP8_BLOCK_SIZE:
+        return None
+    ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)
+    if not ok:
+        return None
+
+    num_tokens, hidden_size = hidden_states.shape
+    device = hidden_states.device
+    quant_out = torch.empty(
+        (num_tokens, hidden_size), dtype=MXFP8_VALUE_DTYPE, device=device
+    )
+    # Rows padded to 128 and scale columns to 4; the kernel leaves the padding
+    # rows unwritten, and the GEMM does not store the outputs that read them.
+    scale_out = torch.empty(
+        round_up(num_tokens, 128) * round_up(hidden_size // MXFP8_BLOCK_SIZE, 4),
+        dtype=MXFP8_SCALE_DTYPE,
+        device=device,
+    )
+    norm_out = torch.empty_like(hidden_states) if return_normed else None
+    flashinfer_trtllm_fused_allreduce_norm(
+        allreduce_in=hidden_states,
+        residual=residual,
+        rms_gamma=norm.weight,
+        rms_eps=norm.variance_epsilon,
+        world_size=tp_size,
+        weight_bias=1.0,  # GemmaRMSNorm-style
+        launch_with_pdl=True,
+        fp32_acc=True,
+        max_token_num=max_token_num,
+        pattern_code=pattern,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
+    )
+    quantized = QuantizedActivation(
+        data=quant_out,
+        scale=scale_out,
+        orig_dtype=hidden_states.dtype,
+        orig_shape=hidden_states.shape,
+        quant_key=kMxfp8Dynamic,
+    )
+    # With norm_out the kernel writes the new residual into the hidden_states
+    # buffer; without it, into `residual` in place.
+    return quantized, norm_out, hidden_states if return_normed else residual
 
 
 def allreduce_gemma_rms_norm_mxfp8(

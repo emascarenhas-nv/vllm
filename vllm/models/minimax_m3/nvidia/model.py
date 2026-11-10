@@ -12,7 +12,8 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
-from collections.abc import Iterable
+import contextlib
+from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,6 +37,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
+    flashinfer_allreduce_gemma_rms_norm_mxfp8,
     fused_allreduce_gemma_rms_norm,
 )
 from vllm.model_executor.layers.fused_moe import (
@@ -467,25 +469,66 @@ class MiniMaxM3MLP(nn.Module):
                 dense_gemm1_mxfp8.MIN_TOKENS,
                 envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
             )
+        # (source tensor, its MXFP8 quantization) handed over by the MoE block
+        # for the next forward: the MoE runner calls the shared expert with the
+        # layer's bf16 input.
+        self._prequant: tuple[torch.Tensor, QuantizedActivation] | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_sequence_parallel:
-            x = sp_all_gather(x)
-        num_tokens = x.shape[0]
+    def _uses_fused_gemm1(self, num_tokens: int) -> bool:
         # Run unfused under FlashInfer autotuning so gate_up_proj is tuned too
-        if (
+        return (
             self.fused_gemm1_min_tokens is not None
             and num_tokens > self.fused_gemm1_min_tokens
             and not is_flashinfer_autotuning()
-        ):
-            from vllm.models.minimax_m3.nvidia.ops.dense_gemm1_mxfp8 import (
-                fused_gemm1,
-            )
+        )
 
-            x = fused_gemm1(x, self.gate_up_proj, self.act_fn)
-        else:
+    def takes_mxfp8_input(self, num_tokens: int) -> bool:
+        """Whether a forward of `num_tokens` rows can take gate_up_proj's
+        input pre-quantized to MXFP8 with 128x4 swizzled scales."""
+        return (
+            not self.use_sequence_parallel
+            and not self._uses_fused_gemm1(num_tokens)
+            and _consumes_mxfp8_128x4(self.gate_up_proj)
+        )
+
+    @contextlib.contextmanager
+    def prequantized(
+        self, src: torch.Tensor, qa: QuantizedActivation
+    ) -> Iterator[None]:
+        """Within the block, the next forward takes `qa` as gate_up_proj's input
+        if it is called on `src`."""
+        self._prequant = (src, qa)
+        try:
+            yield
+        finally:
+            self._prequant = None
+
+    def forward(self, x: torch.Tensor | QuantizedActivation) -> torch.Tensor:
+        pre, self._prequant = self._prequant, None
+        if (
+            pre is not None
+            and isinstance(x, torch.Tensor)
+            and pre[0].data_ptr() == x.data_ptr()
+            and pre[0].shape == x.shape
+        ):
+            x = pre[1]
+        if isinstance(x, QuantizedActivation):
+            # Only given when takes_mxfp8_input holds.
+            assert not self.use_sequence_parallel
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
+        else:
+            if self.use_sequence_parallel:
+                x = sp_all_gather(x)
+            if self._uses_fused_gemm1(x.shape[0]):
+                from vllm.models.minimax_m3.nvidia.ops.dense_gemm1_mxfp8 import (
+                    fused_gemm1,
+                )
+
+                x = fused_gemm1(x, self.gate_up_proj, self.act_fn)
+            else:
+                gate_up, _ = self.gate_up_proj(x)
+                x = self.act_fn(gate_up)
         if self.use_sequence_parallel:
             return _row_parallel_reduce_scatter(x, self.down_proj, self.gemm_rs)
         x, _ = self.down_proj(x)
@@ -666,28 +709,59 @@ class MiniMaxM3MoE(nn.Module):
             and self.experts.moe_config.should_defer_moe_finalize(num_tokens)
         )
 
-    def forward_unfinalized(self, hidden_states: torch.Tensor) -> MoEOutput:
+    def shared_experts_take_mxfp8_input(self, num_tokens: int) -> bool:
+        """Whether `forward(shared_prequant=...)` can hand the shared expert
+        its MXFP8 input for a batch of `num_tokens`."""
+        return (
+            not self.use_mega_moe
+            and self.shared_experts is not None
+            and self.shared_experts.takes_mxfp8_input(num_tokens)
+        )
+
+    def _shared_prequant(
+        self, hidden_states: torch.Tensor, shared_prequant: QuantizedActivation | None
+    ) -> contextlib.AbstractContextManager:
+        if shared_prequant is None:
+            return contextlib.nullcontext()
+        assert self.shared_experts is not None
+        return self.shared_experts.prequantized(hidden_states, shared_prequant)
+
+    def forward_unfinalized(
+        self,
+        hidden_states: torch.Tensor,
+        shared_prequant: QuantizedActivation | None = None,
+    ) -> MoEOutput:
         """`forward` with the routed top-k reduction and all-reduce left open."""
         router_logits, _ = self.gate(hidden_states)
         # The runner's custom op returns tensors only, so run its body directly.
-        shared_output, routed = _unpack(
-            self.experts._forward_impl(hidden_states, router_logits, hidden_states)
-        )
+        with self._shared_prequant(hidden_states, shared_prequant):
+            shared_output, routed = _unpack(
+                self.experts._forward_impl(hidden_states, router_logits, hidden_states)
+            )
         assert shared_output is not None
         assert isinstance(routed, UnfinalizedMoEOutput)
         return MoEOutput(routed=routed, shared_output=shared_output)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_prequant: QuantizedActivation | None = None,
+    ) -> torch.Tensor:
+        """`shared_prequant`: `hidden_states` quantized to MXFP8 for the shared
+        expert's gate_up_proj (the router and routed experts read the bf16
+        rows); see `shared_experts_take_mxfp8_input`."""
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.use_mega_moe:
+            assert shared_prequant is None
             return self._forward_mega_moe(hidden_states)
 
         # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        with self._shared_prequant(hidden_states, shared_prequant):
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1350,9 +1424,20 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 self.input_layernorm.variance_epsilon,
             )
         if self.fuse_input_allreduce and residual is not None:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
-            )
+            fused = None
+            if not self.use_sequence_parallel and _consumes_mxfp8_128x4(
+                self.self_attn.qkv_proj
+            ):
+                # qkv_proj is the only consumer of the normed rows.
+                fused = flashinfer_allreduce_gemma_rms_norm_mxfp8(
+                    hidden_states, residual, self.input_layernorm
+                )
+            if fused is not None:
+                hidden_states, _, residual = fused
+            else:
+                hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                    hidden_states, residual, self.input_layernorm
+                )
         else:
             # MXFP8 output when qkv_proj consumes it (checked per call: LoRA
             # wrappers installed after construction change the key), but not
@@ -1382,23 +1467,50 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
+        shared_prequant: QuantizedActivation | None = None
         if self.use_sequence_parallel:
             # Attention already reduce-scattered its output to this rank's shard.
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
         else:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.post_attention_layernorm
-            )
+            fused = None
+            num_tokens = hidden_states.shape[0]
+            if self.is_moe_layer:
+                if self.block_sparse_moe.shared_experts_take_mxfp8_input(num_tokens):
+                    # MXFP8 for the shared expert's gate_up_proj, bf16 for the
+                    # router and routed experts.
+                    fused = flashinfer_allreduce_gemma_rms_norm_mxfp8(
+                        hidden_states,
+                        residual,
+                        self.post_attention_layernorm,
+                        return_normed=True,
+                    )
+                if fused is not None:
+                    shared_prequant, normed, residual = fused
+                    assert normed is not None
+                    hidden_states = normed
+            elif self.mlp.takes_mxfp8_input(num_tokens):
+                fused = flashinfer_allreduce_gemma_rms_norm_mxfp8(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
+                if fused is not None:
+                    quantized, _, residual = fused
+                    return self.mlp(quantized), residual
+            if fused is None:
+                hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
         if self.is_moe_layer and self.block_sparse_moe.defers_finalize(
             hidden_states.shape[0]
         ):
             # The next layer's input norm finalizes it with the all-reduce.
-            return self.block_sparse_moe.forward_unfinalized(hidden_states), residual
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states)
-        return hidden_states, residual
+            return self.block_sparse_moe.forward_unfinalized(
+                hidden_states, shared_prequant
+            ), residual
+        if self.is_moe_layer:
+            return self.block_sparse_moe(hidden_states, shared_prequant), residual
+        return self.mlp(hidden_states), residual
 
     @property
     def ffn_all_reduce_deferred(self) -> bool:
